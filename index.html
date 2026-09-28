@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>safegrant 资源水位</title>
+<style>
+:root{--bg:#0d1116;--panel:#151b23;--line:#243141;--ink:#e7eef5;--dim:#8ea0b4;
+      --teal:#35c6a8;--amber:#e9b44c;--bad:#e2566d}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif}
+.frame{max-width:1120px;margin:0 auto;padding:20px 22px 40px;display:flex;flex-direction:column;gap:14px}
+.masthead h1{margin:0;font-size:19px;letter-spacing:.4px}
+.masthead p{margin:4px 0 0;color:var(--dim);font-size:13px}
+.console{display:flex;flex-wrap:wrap;gap:10px;align-items:center;background:var(--panel);
+         border:1px solid var(--line);padding:10px 12px}
+.console input{width:70px;background:#0a0e13;border:1px solid var(--line);color:var(--ink);
+               font:inherit;padding:4px 7px}
+.console button{font:inherit;padding:5px 13px;background:#1d2a35;color:var(--ink);
+                border:1px solid var(--line);cursor:pointer}
+.console button:hover{border-color:var(--teal)}
+canvas{width:100%;height:auto;background:#0a0e13;border:1px solid var(--line);display:block}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{font-weight:600;color:var(--dim);text-align:left;font-size:12px;padding:3px 6px;
+   border-bottom:1px solid var(--line)}
+td{padding:3px 6px;border-bottom:1px solid #1b232e;font-size:13px}
+.ledgers{display:flex;gap:16px;flex-wrap:wrap}
+.ledgers section{flex:1 1 240px;min-width:220px}
+.ledgers h3{margin:0 0 6px;font-size:12px;color:var(--dim);font-weight:600}
+dl.marks{display:flex;flex-wrap:wrap;gap:6px 26px;margin:0;padding-top:8px;border-top:1px solid var(--line)}
+dl.marks div{display:flex;gap:8px;align-items:baseline}
+dt{color:var(--dim);font-size:12px}
+dd{margin:0;font-variant-numeric:tabular-nums}
+dd.ok{color:var(--teal)} dd.no{color:var(--bad)}
+</style></head>
+<body>
+<div class="frame">
+  <header class="masthead">
+    <h1>资源水位条带台</h1>
+    <p>每种资源一条水位带：按进程切段、余量留在右端，带尾刻度就是总量；安全链画在带下面。</p>
+  </header>
+  <div class="console">
+    <label>进程 <input id="proc" value="p4"></label>
+    <label>向量 <input id="va" type="number" value="1"> <input id="vb" type="number" value="1"></label>
+    <button id="doDeclare">声明</button>
+    <button id="doRequest">请求</button>
+    <button id="doRelease">释放</button>
+  </div>
+  <canvas id="stage" width="1080" height="360"></canvas>
+  <table id="procTable"></table>
+  <div class="ledgers">
+    <section><h3>受理账</h3><table id="acceptTable"></table></section>
+    <section><h3>拒绝账</h3><table id="rejectTable"></table></section>
+    <section><h3>失败账</h3><table id="failTable"></table></section>
+  </div>
+  <dl class="marks" id="marks"></dl>
+</div>
+<script type="module">
+import { render } from "./app.js";
+
+const SPEC = {
+  state: {
+    total: [2, 2],
+    procs: [],
+    avail: [2, 2],
+    last_seq: [],
+    last_safe: false,
+    accepts: [],
+    rejects: [],
+    fails: [],
+    declares: 0,
+    grants: 0,
+    denies: 0,
+    releases: 0,
+    checks: 0,
+    failed: 0
+  },
+  events: [
+    { kind: "declare", proc: "a", max: [2, 2] },
+    { kind: "declare", proc: "b", max: [2, 2] },
+    { kind: "declare", proc: "c", max: [1, 1] },
+    { kind: "request", proc: "a", vec: [1, 1] },
+    { kind: "request", proc: "b", vec: [1, 1] },
+    { kind: "request", proc: "a", vec: [1, 0] },
+    { kind: "request", proc: "c", vec: [1, 0] },
+    { kind: "request", proc: "a", vec: [1, 0] },
+    { kind: "declare", proc: "b", max: [1, 1] },
+    { kind: "request", proc: "z9", vec: [1, 0] },
+    { kind: "release", proc: "a", vec: [2, 1] },
+    { kind: "request", proc: "b", vec: [2, 2] },
+    { kind: "release", proc: "b", vec: [1, 0] },
+    { kind: "request", proc: "c", vec: [1, 0] }
+  ]
+};
+
+const TONE = ["#35c6a8", "#7aa2f7", "#e9b44c", "#e2566d", "#b48ef0", "#8fbf5a", "#d0d6dd"];
+const canvas = document.getElementById("stage");
+const ctx = canvas.getContext("2d");
+
+function paint(view) {
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.font = "13px system-ui";
+  const rows = view.maxes || [];
+  const tone = {};
+  rows.forEach(function (row, at) { tone[row[0]] = TONE[at % TONE.length]; });
+  const left = 96;
+  const right = w - 96;
+  const top = 54;
+  const step = rows.length > 0 ? Math.min(64, (h - 176) / rows.length) : 64;
+  ctx.fillStyle = "#8ea0b4";
+  ctx.fillText("资源水位（段是各进程已分配，斜纹是余量，右端竖线是总量）", left, 30);
+
+  (view.total || []).forEach(function (cap, spot) {
+    const y = top + spot * step;
+    const span = right - left;
+    ctx.fillStyle = "#8ea0b4";
+    ctx.fillText("R" + (spot + 1) + " 总量 " + cap, 12, y + 16);
+    ctx.fillStyle = "#0d1116";
+    ctx.fillRect(left, y, span, 26);
+    let cursor = left;
+    (view.allocs || []).forEach(function (row) {
+      const amount = row[1][spot] || 0;
+      if (amount > 0) {
+        const wide = cap > 0 ? (amount / cap) * span : 0;
+        ctx.fillStyle = tone[row[0]] || "#7aa2f7";
+        ctx.fillRect(cursor, y, wide, 26);
+        if (wide > 26) {
+          ctx.fillStyle = "#0a0e13";
+          ctx.fillText(row[0] + " " + amount, cursor + 6, y + 18);
+        }
+        cursor += wide;
+      }
+    });
+    const free = view.avail[spot] || 0;
+    const wide = cap > 0 ? (free / cap) * span : 0;
+    ctx.fillStyle = "#1d2a35";
+    ctx.fillRect(cursor, y, wide, 26);
+    ctx.strokeStyle = "#3c4d61";
+    ctx.beginPath();
+    for (let x = cursor; x < cursor + wide; x += 8) {
+      ctx.moveTo(x, y + 26);
+      ctx.lineTo(x + 8, y);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = "#35c6a8";
+    ctx.beginPath();
+    ctx.moveTo(left + span, y - 3);
+    ctx.lineTo(left + span, y + 29);
+    ctx.stroke();
+    ctx.fillStyle = "#8ea0b4";
+    ctx.fillText("余量 " + free, left + span + 8, y + 18);
+    ctx.strokeStyle = "#243141";
+    ctx.strokeRect(left, y, span, 26);
+  });
+
+  const chainY = top + (view.total || []).length * step + 34;
+  ctx.fillStyle = "#8ea0b4";
+  ctx.fillText("安全链（最近一次安全检查的完成顺序）", left, chainY - 12);
+  if (view.last_safe) {
+    ctx.fillStyle = "#35c6a8";
+    ctx.fillText("判定 安全", left, chainY + 18);
+  } else {
+    ctx.fillStyle = "#e2566d";
+    ctx.fillText("判定 不安全", left, chainY + 18);
+  }
+  let chainX = left + 110;
+  (view.last_seq || []).forEach(function (name) {
+    ctx.fillStyle = tone[name] || "#7aa2f7";
+    ctx.fillRect(chainX, chainY, 62, 24);
+    ctx.fillStyle = "#0a0e13";
+    ctx.fillText(name, chainX + 8, chainY + 17);
+    ctx.strokeStyle = "#3c4d61";
+    ctx.beginPath();
+    ctx.moveTo(chainX + 62, chainY + 12);
+    ctx.lineTo(chainX + 82, chainY + 12);
+    ctx.stroke();
+    chainX += 82;
+  });
+  if ((view.last_seq || []).length === 0) {
+    ctx.fillStyle = "#8ea0b4";
+    ctx.fillText("（这一轮挑不出可完成的进程）", chainX, chainY + 17);
+  }
+
+  const stamp = view.safe_now ? "当前状态安全" : "当前状态不安全";
+  ctx.fillStyle = view.safe_now ? "#35c6a8" : "#e2566d";
+  ctx.textAlign = "right";
+  ctx.fillText(stamp, right + 90, chainY + 18);
+  ctx.textAlign = "left";
+}
+
+function fillTable(node, head, body) {
+  const thead = "<tr>" + head.map(function (cell) { return "<th>" + cell + "</th>"; }).join("") + "</tr>";
+  const rows = body.map(function (row) {
+    return "<tr>" + row.map(function (cell) { return "<td>" + cell + "</td>"; }).join("") + "</tr>";
+  }).join("");
+  node.innerHTML = thead + rows;
+}
+
+function marks(view) {
+  const box = document.getElementById("marks");
+  const items = [
+    ["声明数", view.declares, true],
+    ["受理数", view.grants, true],
+    ["拒绝数", view.denies, true],
+    ["释放数", view.releases, true],
+    ["检查次数", view.checks, true],
+    ["失败事件数", view.failed, true],
+    ["守恒成立", view.conserve, view.conserve],
+    ["需求闭合", view.closure, view.closure],
+    ["非负成立", view.nonneg, view.nonneg],
+    ["检查次数对账", view.checks_ok, view.checks_ok],
+    ["重放不新增", view.replay_new === 0, view.replay_new === 0],
+    ["拆两轮一致", view.split_equal, view.split_equal]
+  ];
+  box.innerHTML = items.map(function (item) {
+    const tone = item[1] === true ? "ok" : item[1] === false ? "no" : "";
+    return "<div><dt>" + item[0] + "</dt><dd class=\"" + tone + "\">" + String(item[1]) + "</dd></div>";
+  }).join("");
+}
+
+function draw() {
+  const view = render(SPEC);
+  paint(view);
+  fillTable(document.getElementById("procTable"), ["进程", "最大需求", "已分配", "还需"], (view.maxes || []).map(function (row, at) {
+    return [row[0], "[" + row[1].join(", ") + "]", "[" + (view.allocs[at][1] || []).join(", ") + "]",
+            "[" + (view.needs[at][1] || []).join(", ") + "]"];
+  }));
+  fillTable(document.getElementById("acceptTable"), ["进程", "向量", "安全序列"],
+    (view.accepts || []).map(function (row) { return [row[0], row[1].join("/"), (row[2] || []).join("→")]; }));
+  fillTable(document.getElementById("rejectTable"), ["进程", "报码"],
+    (view.rejects || []).map(function (row) { return [row[0], row[1]]; }));
+  fillTable(document.getElementById("failTable"), ["事件", "报码"],
+    (view.fails || []).map(function (row) { return [row[0], row[1]]; }));
+  marks(view);
+}
+
+document.getElementById("doDeclare").addEventListener("click", function () {
+  SPEC.events.push({ kind: "declare", proc: document.getElementById("proc").value,
+                     max: [Number(document.getElementById("va").value), Number(document.getElementById("vb").value)] });
+  draw();
+});
+document.getElementById("doRequest").addEventListener("click", function () {
+  SPEC.events.push({ kind: "request", proc: document.getElementById("proc").value,
+                     vec: [Number(document.getElementById("va").value), Number(document.getElementById("vb").value)] });
+  draw();
+});
+document.getElementById("doRelease").addEventListener("click", function () {
+  SPEC.events.push({ kind: "release", proc: document.getElementById("proc").value,
+                     vec: [Number(document.getElementById("va").value), Number(document.getElementById("vb").value)] });
+  draw();
+});
+draw();
+</script>
+</body>
+</html>
